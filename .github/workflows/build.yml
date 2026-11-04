@@ -8,6 +8,11 @@ on:
 permissions:
   contents: write
 
+# 同一分支同时只允许一个构建，避免并发 tag 冲突
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -72,7 +77,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== patch_rootfs.py 尝试 ==="
-          # 需要 work/trimfs.tgz；基础 rootfs 已烘焙驱动，先尝试直接解压验证
           mkdir -p work
           python3 tools/patch_rootfs.py --base "$(pwd)" 2>&1 || echo "patch_rootfs 跳过（无 trimfs.tgz）"
           python3 tools/build_drivers_overlay.py --base "$(pwd)" 2>&1 || echo "build_drivers_overlay 跳过（无 boot_fnos_k20pro.img）"
@@ -84,7 +88,6 @@ jobs:
           set -euo pipefail
           echo "=== repack_boot.py 尝试 ==="
           mkdir -p work
-          # 从 base/boot.img 提取 initramfs 需要原始构建文件；没有则跳过
           python3 tools/repack_boot.py --base "$(pwd)" 2>&1 || echo "repack_boot 跳过（缺 boot.img 构建输入）"
           python3 tools/make_dtbo.py --base "$(pwd)" 2>&1 || echo "make_dtbo 跳过"
 
@@ -92,7 +95,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # 如果生成了新镜像则用新的，否则保留上游基础文件
           cd base
           for f in boot.img rootfs.tar.gz dtbo.img; do
             if [ -f "../work/${f}" ]; then
@@ -101,7 +103,6 @@ jobs:
               cp "${f}" "../dist/${f}"
             fi
           done
-          # 附加修改过的 config/ 供参考
           if [ -d ../config ]; then
             cp -r ../config ../dist/config
           fi
@@ -118,8 +119,9 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: fnos-k20pro-flash-package.zip
-          tag_name: build-${{ github.sha }}
-          name: Build ${{ github.sha }}
+          # run_id 保证 tag 唯一，避免并发冲突
+          tag_name: build-${{ github.sha }}-${{ github.run_id }}
+          name: Build ${{ github.sha }} (run ${{ github.run_id }})
           body: |
             Automated build from commit ${{ github.sha }}.
             Modified files: ${{ steps.changes.outputs.modified }}
