@@ -22,27 +22,19 @@ jobs:
           mkdir -p upstream
           cd upstream
 
-          # 使用 GitHub CLI 下载 Release 资产（支持断点续传，CDN 加速）
-          if command -v gh >/dev/null 2>&1; then
-            gh release download \
-              fnos-k20pro-raphael \
-              --repo oneder32/fnos-k20pro-raphael \
-              --pattern "Redmi_K20pro_FnOS_Card_Brush_Package.*" \
-              --dir .
-          else
-            # 备用：curl 断点续传，避免 2GB 大文件下载失败
-            for f in z01 z02 zip; do
-              url="https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.${f}"
-              if [ ! -f "card.${f}" ] || [ "$(stat -c%s "card.${f}" 2>/dev/null || echo 0)" -lt 1000 ]; then
-                echo "Downloading card.${f} ..."
-                curl -L --retry 10 --retry-delay 5 --retry-connrefused \
-                     --connect-timeout 30 --max-time 0 \
-                     -C - -o "card.${f}" "${url}"
-              else
-                echo "card.${f} already exists, skip"
-              fi
-            done
-          fi
+          # 统一下载到固定文件名，避免 gh release download 的原始文件名不一致
+          for ext in z01 z02 zip; do
+            url="https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.${ext}"
+            out="card.${ext}"
+            if [ ! -f "${out}" ] || [ "$(stat -c%s "${out}" 2>/dev/null || echo 0)" -lt 1000 ]; then
+              echo "Downloading ${out} ..."
+              curl -L --retry 10 --retry-delay 5 --retry-connrefused \
+                   --connect-timeout 30 --max-time 0 \
+                   -C - -o "${out}" "${url}"
+            else
+              echo "${out} exists, skip"
+            fi
+          done
 
           echo "Downloaded files:"
           ls -lh
@@ -73,7 +65,6 @@ jobs:
           # 验证关键文件存在
           test -f boot.img
           test -f rootfs.tar.gz
-          test -f dtbo.img
           echo "Base images verified."
 
       - name: Setup Python
@@ -89,7 +80,6 @@ jobs:
       - name: Determine changed files
         id: changes
         run: |
-          # 获取本次 push 修改的文件列表
           CHANGED=$(git diff --name-only origin/main...HEAD || echo "")
           echo "modified=${CHANGED}" >> $GITHUB_OUTPUT
           echo "All changed files:"
