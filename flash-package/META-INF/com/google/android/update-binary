@@ -1,0 +1,111 @@
+#!/sbin/sh
+# fnOS K20 Pro (raphael) Recovery 卡刷脚本
+# 由 GitHub Actions 自动生成
+# 功能：格式化 /dev/block/sda35 -> 解压 rootfs.tar.gz -> 刷 boot/dtbo
+
+OUTFD=$2
+ZIPFILE=$3
+
+ui_print() {
+  echo "ui_print $1" >&$OUTFD
+  echo "ui_print" >&$OUTFD
+}
+
+abort_install() {
+  ui_print "ERROR: $1"
+  exit 1
+}
+
+ui_print "================================"
+ui_print " fnOS K20 Pro (raphael)"
+ui_print " Recovery Installer"
+ui_print "================================"
+
+# ---- 0. 找到可用工具 ----
+find_tool() {
+  for t in "$@"; do
+    command -v "$t" >/dev/null 2>&1 && { echo "$t"; return; }
+  done
+  # 常见路径兜底
+  for p in /sbin /system/bin /system/xbin /bin; do
+    for t in "$@"; do
+      [ -x "$p/$t" ] && { echo "$p/$t"; return; }
+    done
+  done
+}
+UNZIP=$(find_tool unzip busybox)
+TAR=$(find_tool tar busybox)
+MKFS=$(find_tool mkfs.ext4 mke2fs)
+[ -z "$UNZIP" ] && abort_install "unzip not found"
+[ -z "$TAR" ] && abort_install "tar not found"
+[ -z "$MKFS" ] && abort_install "mkfs.ext4 not found"
+ui_print "Using tools: unzip=$UNZIP tar=$TAR mkfs=$MKFS"
+
+# ---- 1. 查找分区 ----
+ui_print "Locating partitions..."
+ROOT_DEV="/dev/block/sda35"
+[ -b "$ROOT_DEV" ] || abort_install "root dev $ROOT_DEV not found"
+
+# boot 分区（A/B 设备由 by-name 符号链接指向当前槽位）
+BOOT_DEV=""
+for d in /dev/block/bootdevice/by-name/boot /dev/block/by-name/boot          /dev/block/boot/by-name/boot /dev/block/bootdevice/by-name/boot_a; do
+  if [ -b "$d" ]; then BOOT_DEV="$d"; break; fi
+done
+if [ -z "$BOOT_DEV" ]; then
+  for p in /dev/block/*/by-name/boot*; do
+    [ -b "$p" ] && { BOOT_DEV="$p"; break; }
+  done
+fi
+[ -z "$BOOT_DEV" ] && abort_install "boot partition not found"
+ui_print "boot: $BOOT_DEV  root: $ROOT_DEV"
+
+# dtbo 分区（可选）
+DTBO_DEV=""
+for d in /dev/block/bootdevice/by-name/dtbo /dev/block/by-name/dtbo          /dev/block/bootdevice/by-name/dtbo_a; do
+  if [ -b "$d" ]; then DTBO_DEV="$d"; break; fi
+done
+
+# ---- 2. 提取小文件到 /tmp ----
+ui_print "Extracting boot.img / dtbo.img ..."
+mkdir -p /tmp/k20flash
+cd /tmp/k20flash || exit 1
+"$UNZIP" -o "$ZIPFILE" boot.img dtbo.img >/dev/null 2>&1   || abort_install "extract boot/dtbo failed"
+ls -l boot.img
+
+# ---- 3. 格式化根分区 ----
+ui_print "Formatting $ROOT_DEV (ext4)..."
+"$MKFS" -F "$ROOT_DEV" >/dev/null 2>&1 || abort_install "mkfs.ext4 failed"
+
+# ---- 4. 挂载并解压 rootfs ----
+ui_print "Mounting $ROOT_DEV ..."
+mkdir -p /tmp/k20root
+mount -t ext4 "$ROOT_DEV" /tmp/k20root 2>/dev/null   || abort_install "mount $ROOT_DEV failed"
+
+ui_print "Extracting rootfs.tar.gz (take a while, ~2GB)..."
+# zip 内直接流式解压，不占用 /tmp 空间
+if [ "$UNZIP" = "busybox" ]; then
+  busybox unzip -p "$ZIPFILE" rootfs.tar.gz | busybox tar -xz -C /tmp/k20root     || abort_install "rootfs extract failed"
+else
+  unzip -p "$ZIPFILE" rootfs.tar.gz | tar -xz -C /tmp/k20root     || abort_install "rootfs extract failed"
+fi
+sync
+umount /tmp/k20root || true
+ui_print "rootfs extracted OK"
+
+# ---- 5. 刷入 boot ----
+ui_print "Flashing boot.img -> $BOOT_DEV ..."
+dd if=/tmp/k20flash/boot.img of="$BOOT_DEV" bs=4096 2>/dev/null   || abort_install "boot flash failed"
+
+# ---- 6. 刷入 dtbo（可选） ----
+if [ -n "$DTBO_DEV" ] && [ -f /tmp/k20flash/dtbo.img ]; then
+  ui_print "Flashing dtbo.img -> $DTBO_DEV ..."
+  dd if=/tmp/k20flash/dtbo.img of="$DTBO_DEV" bs=4096 2>/dev/null     || ui_print "WARN: dtbo flash failed (non-fatal)"
+else
+  ui_print "dtbo partition not found, skip"
+fi
+
+ui_print "================================"
+ui_print " Install complete!"
+ui_print " Reboot to system now."
+ui_print "================================"
+exit 0
