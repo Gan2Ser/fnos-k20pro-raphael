@@ -3,9 +3,16 @@
 # gzip tarball. Rootfs entries come first, driver entries appended after them,
 # so on extraction any same-path driver file wins. Only ONE end-of-archive
 # marker is written at the very end.
-import gzip, os, sys
+import argparse
+import gzip
+import os
 
-base = r'E:\DeepSeek Harness\fnos'
+parser = argparse.ArgumentParser(description='Merge drivers overlay into fnOS rootfs')
+parser.add_argument('--base', default=os.getcwd(),
+                    help='Working directory (default: current directory)')
+args = parser.parse_args()
+base = args.base
+
 dist = os.path.join(base, 'dist')
 rootfs = os.path.join(dist, 'fnos_k20pro_rootfs.tar.gz')
 drivers = os.path.join(dist, 'fnos_k20pro_drivers.tar.gz')
