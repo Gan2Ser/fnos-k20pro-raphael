@@ -22,19 +22,24 @@ jobs:
           mkdir -p upstream
           cd upstream
 
-          # 统一下载到固定文件名，避免 gh release download 的原始文件名不一致
-          for ext in z01 z02 zip; do
-            url="https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.${ext}"
-            out="card.${ext}"
-            if [ ! -f "${out}" ] || [ "$(stat -c%s "${out}" 2>/dev/null || echo 0)" -lt 1000 ]; then
-              echo "Downloading ${out} ..."
-              curl -L --retry 10 --retry-delay 5 --retry-connrefused \
-                   --connect-timeout 30 --max-time 0 \
-                   -C - -o "${out}" "${url}"
-            else
-              echo "${out} exists, skip"
-            fi
-          done
+          echo "Downloading via gh release download (fast CDN)..."
+          gh release download \
+            fnos-k20pro-raphael \
+            --repo oneder32/fnos-k20pro-raphael \
+            --pattern "Redmi_K20pro_FnOS_Card_Brush_Package.*" \
+            --dir .
+
+          echo "Renaming to fixed filenames..."
+          # gh 下载后文件名是完整原始名，统一重命名
+          if ls Redmi_K20pro_FnOS_Card_Brush_Package.z01 >/dev/null 2>&1; then
+            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.z01 card.z01
+          fi
+          if ls Redmi_K20pro_FnOS_Card_Brush_Package.z02 >/dev/null 2>&1; then
+            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.z02 card.z02
+          fi
+          if ls Redmi_K20pro_FnOS_Card_Brush_Package.zip >/dev/null 2>&1; then
+            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.zip card.zip
+          fi
 
           echo "Downloaded files:"
           ls -lh
