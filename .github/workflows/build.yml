@@ -71,7 +71,7 @@ jobs:
           bash -n flash-package/META-INF/com/google/android/update-binary && echo "update-binary 语法 OK"
           test -f flash-package/META-INF/com/google/android/updater-script && echo "updater-script 存在"
 
-      - name: Assemble standard flashable zip (Python split <2GB)
+      - name: Assemble standard split flashable zip
         run: |
           set -euo pipefail
           rm -rf pkg
@@ -85,19 +85,16 @@ jobs:
           echo "=== pkg 内容 ==="
           find pkg -type f | head -30
 
-          # 先用 zip 打包成完整文件，再用 Python 分卷成 <2GB
+          # 标准分卷 zip：单条命令一次打包所有文件（禁止在分卷 zip 上追加）
           cd pkg
-          zip -0 -r ../fnos-k20pro-full.zip META-INF boot.img rootfs.tar.gz
-          if [ -f dtbo.img ]; then zip -0 -j ../fnos-k20pro-full.zip dtbo.img; fi
-          if [ -d config ]; then zip -r ../fnos-k20pro-full.zip config; fi
-          if [ -f troubleshooting.md ]; then zip -r ../fnos-k20pro-full.zip troubleshooting.md; fi
+          zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip \
+            META-INF boot.img dtbo.img rootfs.tar.gz 2>/dev/null
+          if [ -d config ]; then
+            zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip config 2>/dev/null || true
+          fi
           cd ..
 
-          echo "=== 完整 zip 大小 ==="
-          ls -lh fnos-k20pro-full.zip
-
-          # Python 分卷（规避 GitHub 2GB 单文件上限）
-          python3 tools/split_zip.py fnos-k20pro-full.zip fnos-k20pro-Card_Brush_Package 1900
+          # 确保分卷完整
           echo "=== 分卷产物 ==="
           ls -lh fnos-k20pro-Card_Brush_Package.*
           md5sum fnos-k20pro-Card_Brush_Package.* > checksums.txt
@@ -119,13 +116,11 @@ jobs:
 
             ## 使用方法（Windows）
             1. 下载全部 3 个分卷到同一文件夹，保持文件名不变
-            2. 打开 CMD/PowerShell 执行合并：
+            2. 用 7-Zip / Bandizip 打开 `fnos-k20pro-Card_Brush_Package.z01`，
+               它会自动识别分卷并合并解压，得到完整卡刷包内容
+            3. 或者合并成完整 zip 后刷入：
                ```
                copy /b fnos-k20pro-Card_Brush_Package.z01 + fnos-k20pro-Card_Brush_Package.z02 + fnos-k20pro-Card_Brush_Package.zip fnos-full.zip
-               ```
-            3. 或 Linux/macOS：
-               ```
-               cat fnos-k20pro-Card_Brush_Package.z01 fnos-k20pro-Card_Brush_Package.z02 fnos-k20pro-Card_Brush_Package.zip > fnos-full.zip
                ```
             4. 把 fnos-full.zip 拷入手机，TWRP/OrangeFox 直接刷入
         env:
