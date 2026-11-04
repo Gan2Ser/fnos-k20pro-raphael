@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 # Repack the K20 Pro boot.img: point rootfs at /dev/sda35, set hostname "trim".
-import os, struct, hashlib, lzma
+import argparse
+import os
+import struct
+import hashlib
+import lzma
 
-base = r'E:\DeepSeek Harness\fnos'
+parser = argparse.ArgumentParser(description='Repack K20 Pro boot.img')
+parser.add_argument('--base', default=os.getcwd(),
+                    help='Working directory (default: current directory)')
+args = parser.parse_args()
+base = args.base
+
 work = os.path.join(base, 'work')
 dist = os.path.join(base, 'dist')
 os.makedirs(dist, exist_ok=True)
@@ -83,7 +92,6 @@ for e in entries:
         e['data'] = b'127.0.0.1 localhost trim\n'
 assert init_found and host_found, (init_found, host_found)
 
-# add a new modules-load.d entry for Bluetooth auto-load
 bt_conf = (b'# K20 Pro (raphael) Bluetooth: WCN3990 via UART (btqca + hci_uart)\n'
            b'bluetooth\nhci_uart\nbtqca\nrfcomm\n')
 bt_entry = dict(ino=0, mode=0o100644, uid=0, gid=0, nlink=1, mtime=0,
@@ -94,7 +102,6 @@ entries.insert(trailer_idx, bt_entry)
 print('added etc/modules-load.d/raphael-bt.conf')
 
 new_cpio = serialize_newc(entries)
-# verify round-trip
 rt = parse_newc(new_cpio)
 assert len(rt) == len(entries), (len(rt), len(entries))
 rt_init = next(e for e in rt if e['name'] == b'init')['data']
@@ -112,7 +119,6 @@ open(os.path.join(work, 'initramfs_new.cpio'), 'wb').write(new_cpio)
 ramdisk = lzma.compress(new_cpio, format=lzma.FORMAT_XZ,
                         check=lzma.CHECK_CRC32, preset=6)
 open(os.path.join(work, 'ramdisk_new.xz'), 'wb').write(ramdisk)
-# sanity: decompress back
 assert lzma.decompress(ramdisk) == new_cpio
 print('new ramdisk (xz) size:', len(ramdisk))
 
@@ -127,16 +133,13 @@ kernel = boot[page_size:page_size + kernel_size]
 assert kernel[:2] == b'\x1f\x8b' and kernel.find(bytes.fromhex('d00dfeed')) > 0
 
 header_page = bytearray(boot[:page_size])
-# ramdisk_size @16
 struct.pack_into('<I', header_page, 16, len(ramdisk))
-# cmdline @64 (512 bytes)
 cmd = (b'clk_ignore_unused pd_ignore_unused arm64.nopauth root=/dev/sda35 rw '
        b'rootwait quiet splash loglevel=3 systemd.show_status=false '
        b'rd.udev.log_level=3 vt.global_cursor_default=0 panic=100 console=tty0')
 assert len(cmd) <= 512
 header_page[64:64+512] = b'\x00' * 512
 header_page[64:64+len(cmd)] = cmd
-# id @576 (32 bytes): SHA1(kernel || ramdisk), 20 bytes + zero pad
 sha = hashlib.sha1(kernel + ramdisk).digest()
 header_page[576:576+32] = b'\x00' * 32
 header_page[576:576+20] = sha
@@ -148,7 +151,6 @@ out_path = os.path.join(dist, 'boot_fnos_k20pro.img')
 open(out_path, 'wb').write(new_boot)
 print('wrote', out_path, 'size', len(new_boot))
 
-# ---- 3. Verify the new boot.img ----
 nb = open(out_path, 'rb').read()
 ks2 = struct.unpack('<I', nb[8:12])[0]
 rs2 = struct.unpack('<I', nb[16:20])[0]
