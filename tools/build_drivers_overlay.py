@@ -2,9 +2,20 @@
 # Build a self-contained "drivers" overlay tarball for fnOS on K20 Pro,
 # taken from the boot.img initramfs (the canonical phone driver bundle),
 # plus the 4 extra module-metadata files that exist in kali.tar.
-import os, struct, lzma, tarfile, io, time
+import argparse
+import os
+import struct
+import lzma
+import tarfile
+import io
+import time
 
-base = r'E:\DeepSeek Harness\fnos'
+parser = argparse.ArgumentParser(description='Build K20 Pro drivers overlay')
+parser.add_argument('--base', default=os.getcwd(),
+                    help='Working directory (default: current directory)')
+args = parser.parse_args()
+base = args.base
+
 dist = os.path.join(base, 'dist')
 os.makedirs(dist, exist_ok=True)
 
@@ -48,7 +59,6 @@ INCLUDE_PREFIXES = [
 INCLUDE_NAMES = {
     b'usr/bin/pd-mapper', b'usr/bin/qrtr-ns', b'usr/bin/tqftpserv', b'usr/bin/rmtfs',
 }
-# for usr/lib/systemd/system, only take the modem units
 UNIT_OK = {b'pd-mapper.service', b'qrtr-ns.service', b'rmtfs.service', b'tqftpserv.service'}
 
 selected = []
@@ -94,7 +104,6 @@ with tarfile.open(out_path, 'w:gz') as tar:
             ti.type = tarfile.SYMTYPE; ti.size = 0
             ti.linkname = e['data'].decode('utf-8', 'replace')
             tar.addfile(ti); n_lnk += 1
-    # add kali's 4 extra module metadata files
     km = os.path.join(base, 'work', 'kali_drivers', 'usr', 'lib', 'modules', '6.16.9-sm8150')
     for fn in ['modules.builtin.alias.bin', 'modules.devname', 'modules.softdep', 'modules.weakdep']:
         p = os.path.join(km, fn)
