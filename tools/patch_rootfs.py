@@ -2,9 +2,16 @@
 # Patch ./etc/fstab inside trimfs.tgz (gzip tar) by streaming, so that
 # every other member (symlinks, permissions, ownership, device nodes, PAX
 # headers) is preserved byte-for-byte.
-import gzip, os, sys
+import argparse
+import gzip
+import os
 
-base = r'E:\DeepSeek Harness\fnos'
+parser = argparse.ArgumentParser(description='Patch fnOS rootfs fstab for K20 Pro')
+parser.add_argument('--base', default=os.getcwd(),
+                    help='Working directory (default: current directory)')
+args = parser.parse_args()
+base = args.base
+
 src = os.path.join(base, 'work', 'trimfs.tgz')
 dst = os.path.join(base, 'dist', 'fnos_k20pro_rootfs.tar.gz')
 
@@ -32,7 +39,6 @@ def read_exact(f, n):
 
 def parse_size(field):
     if field[0] & 0x80:
-        # GNU base-256
         n = 0
         for b in field:
             n = n * 256 + b
