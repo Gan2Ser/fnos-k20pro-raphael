@@ -22,8 +22,14 @@ sleep 1
 /sbin/udevadm settle --timeout=30 2>/dev/null
 
 # ---- Load storage drivers ----
-KERNEL_VER=$(ls /usr/lib/modules/ 2>/dev/null | head -1)
+KERNEL_VER="6.16.9-sm8150"
 MODDIR="/usr/lib/modules/${KERNEL_VER}"
+if [ ! -d "$MODDIR" ]; then
+    echo "ERROR: expected kernel modules at $MODDIR"
+    ls /usr/lib/modules/ 2>/dev/null || true
+    /bin/sh
+    exit 1
+fi
 load_mod() {
     local file
     file=$(find "$MODDIR" -name "${1}.ko*" 2>/dev/null | head -1)
