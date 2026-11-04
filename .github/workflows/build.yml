@@ -11,82 +11,139 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Download upstream flash package
         run: |
+          set -euo pipefail
           mkdir -p upstream
           cd upstream
-          curl -L --retry 3 --retry-delay 5 -o card.z01 \
-            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.z01
-          curl -L --retry 3 --retry-delay 5 -o card.z02 \
-            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.z02
-          curl -L --retry 3 --retry-delay 5 -o card.zip \
-            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.zip
+
+          # 使用 GitHub CLI 下载 Release 资产（支持断点续传，CDN 加速）
+          if command -v gh >/dev/null 2>&1; then
+            gh release download \
+              fnos-k20pro-raphael \
+              --repo oneder32/fnos-k20pro-raphael \
+              --pattern "Redmi_K20pro_FnOS_Card_Brush_Package.*" \
+              --dir .
+          else
+            # 备用：curl 断点续传，避免 2GB 大文件下载失败
+            for f in z01 z02 zip; do
+              url="https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.${f}"
+              if [ ! -f "card.${f}" ] || [ "$(stat -c%s "card.${f}" 2>/dev/null || echo 0)" -lt 1000 ]; then
+                echo "Downloading card.${f} ..."
+                curl -L --retry 10 --retry-delay 5 --retry-connrefused \
+                     --connect-timeout 30 --max-time 0 \
+                     -C - -o "card.${f}" "${url}"
+              else
+                echo "card.${f} already exists, skip"
+              fi
+            done
+          fi
+
+          echo "Downloaded files:"
+          ls -lh
 
           # 合并多卷 zip 并修复结构
+          echo "Merging zip volumes..."
           cat card.z01 card.z02 card.zip > full.zip
-          zip -FF full.zip --out fixed.zip -f -v
+          zip -FF full.zip --out fixed.zip -f -v > /tmp/zipff.log 2>&1 || true
+          echo "--- zip -FF log ---"
+          cat /tmp/zipff.log
+
+          # 验证修复后的 zip
+          if ! unzip -tq fixed.zip >/dev/null 2>&1; then
+            echo "zip -FF failed, trying alternative repair..."
+            zip -FF full.zip --out fixed2.zip -F -q
+            mv fixed2.zip fixed.zip
+          fi
 
       - name: Extract base images
         run: |
+          set -euo pipefail
           mkdir -p base
           cd base
           unzip -q ../upstream/fixed.zip
           echo "Extracted files:"
           ls -lh
 
+          # 验证关键文件存在
+          test -f boot.img
+          test -f rootfs.tar.gz
+          test -f dtbo.img
+          echo "Base images verified."
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lzma
+
       - name: Determine changed files
         id: changes
         run: |
-          echo "modified=$(git diff --name-only HEAD~1 HEAD || echo '')" >> $GITHUB_OUTPUT
+          # 获取本次 push 修改的文件列表
+          CHANGED=$(git diff --name-only origin/main...HEAD || echo "")
+          echo "modified=${CHANGED}" >> $GITHUB_OUTPUT
+          echo "All changed files:"
+          echo "${CHANGED}"
 
-      - name: Patch rootfs (if needed)
-        if: contains(steps.changes.outputs.modified, 'tools/') || contains(steps.changes.outputs.modified, 'config/') || contains(steps.changes.outputs.modified, 'init_script.sh')
+      - name: Patch rootfs
+        if: contains(steps.changes.outputs.modified, 'tools/') || contains(steps.changes.outputs.modified, 'config/') || contains(steps.changes.outputs.modified, 'init_script.sh') || contains(steps.changes.outputs.modified, 'flash.sh')
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq lzma
+          set -euo pipefail
           mkdir -p work
-          python3 tools/patch_rootfs.py --base $(pwd)
-          python3 tools/build_drivers_overlay.py --base $(pwd)
-          python3 tools/merge_drivers.py --base $(pwd)
+          cd work
+          python3 ../tools/patch_rootfs.py --base $(pwd)/..
+          python3 ../tools/build_drivers_overlay.py --base $(pwd)/..
+          python3 ../tools/merge_drivers.py --base $(pwd)/..
+          echo "Rootfs patched and drivers merged."
 
-      - name: Repack boot.img (if needed)
+      - name: Repack boot.img
         if: contains(steps.changes.outputs.modified, 'tools/init_script.sh')
         run: |
+          set -euo pipefail
           mkdir -p work
-          python3 tools/repack_boot.py --base $(pwd)
-          python3 tools/make_dtbo.py --base $(pwd)
+          cd work
+          python3 ../tools/repack_boot.py --base $(pwd)/..
+          python3 ../tools/make_dtbo.py --base $(pwd)/..
+          echo "boot.img repacked."
 
       - name: Package artifacts
         run: |
+          set -euo pipefail
           mkdir -p dist
           cd base
-          # 如果被修改，使用新生成的文件；否则使用原始文件
+
           if [ -f ../work/boot_fnos_k20pro.img ]; then
             cp ../work/boot_fnos_k20pro.img dist/
           else
             cp boot.img dist/boot_fnos_k20pro.img
           fi
+
           if [ -f ../work/dtbo.img ]; then
             cp ../work/dtbo.img dist/
-          else
-            cp dtbo.img dist/ 2>/dev/null || true
+          elif [ -f dtbo.img ]; then
+            cp dtbo.img dist/
           fi
-          if [ -f ../work/rootfs_patched.tar.gz ]; then
-            cp ../work/rootfs_patched.tar.gz dist/rootfs.tar.gz
-          else
+
+          if [ -f ../work/fnos_k20pro_rootfs.tar.gz ]; then
+            cp ../work/fnos_k20pro_rootfs.tar.gz dist/rootfs.tar.gz
+          elif [ -f rootfs.tar.gz ]; then
             cp rootfs.tar.gz dist/
           fi
 
           cd dist
           zip -r ../flash-package.zip .
-          echo "PACKAGE_SIZE=$(ls -lh flash-package.zip | awk '{print $5}')" >> $GITHUB_ENV
+          echo "Package created:"
+          ls -lh ../flash-package.zip
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
