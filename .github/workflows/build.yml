@@ -1,0 +1,101 @@
+name: Build fnOS Flash Package
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download upstream flash package
+        run: |
+          mkdir -p upstream
+          cd upstream
+          curl -L --retry 3 --retry-delay 5 -o card.z01 \
+            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.z01
+          curl -L --retry 3 --retry-delay 5 -o card.z02 \
+            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.z02
+          curl -L --retry 3 --retry-delay 5 -o card.zip \
+            https://github.com/oneder32/fnos-k20pro-raphael/releases/download/fnos-k20pro-raphael/Redmi_K20pro_FnOS_Card_Brush_Package.zip
+
+          # 合并多卷 zip 并修复结构
+          cat card.z01 card.z02 card.zip > full.zip
+          zip -FF full.zip --out fixed.zip -f -v
+
+      - name: Extract base images
+        run: |
+          mkdir -p base
+          cd base
+          unzip -q ../upstream/fixed.zip
+          echo "Extracted files:"
+          ls -lh
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Determine changed files
+        id: changes
+        run: |
+          echo "modified=$(git diff --name-only HEAD~1 HEAD || echo '')" >> $GITHUB_OUTPUT
+
+      - name: Patch rootfs (if needed)
+        if: contains(steps.changes.outputs.modified, 'tools/') || contains(steps.changes.outputs.modified, 'config/') || contains(steps.changes.outputs.modified, 'init_script.sh')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lzma
+          mkdir -p work
+          python3 tools/patch_rootfs.py --base $(pwd)
+          python3 tools/build_drivers_overlay.py --base $(pwd)
+          python3 tools/merge_drivers.py --base $(pwd)
+
+      - name: Repack boot.img (if needed)
+        if: contains(steps.changes.outputs.modified, 'tools/init_script.sh')
+        run: |
+          mkdir -p work
+          python3 tools/repack_boot.py --base $(pwd)
+          python3 tools/make_dtbo.py --base $(pwd)
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cd base
+          # 如果被修改，使用新生成的文件；否则使用原始文件
+          if [ -f ../work/boot_fnos_k20pro.img ]; then
+            cp ../work/boot_fnos_k20pro.img dist/
+          else
+            cp boot.img dist/boot_fnos_k20pro.img
+          fi
+          if [ -f ../work/dtbo.img ]; then
+            cp ../work/dtbo.img dist/
+          else
+            cp dtbo.img dist/ 2>/dev/null || true
+          fi
+          if [ -f ../work/rootfs_patched.tar.gz ]; then
+            cp ../work/rootfs_patched.tar.gz dist/rootfs.tar.gz
+          else
+            cp rootfs.tar.gz dist/
+          fi
+
+          cd dist
+          zip -r ../flash-package.zip .
+          echo "PACKAGE_SIZE=$(ls -lh flash-package.zip | awk '{print $5}')" >> $GITHUB_ENV
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: flash-package.zip
+          tag_name: build-${{ github.sha }}
+          name: Build ${{ github.sha }}
+          body: |
+            Automated build from commit ${{ github.sha }}.
+            Modified files: ${{ steps.changes.outputs.modified }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
