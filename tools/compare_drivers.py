@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 # Compare drivers (modules + firmware) between kali.tar and the boot.img initramfs.
-import os, tarfile
+import argparse
+import os
+import tarfile
 
-base = r'E:\DeepSeek Harness\fnos'
+parser = argparse.ArgumentParser(description='Compare drivers between kali.tar and initramfs')
+parser.add_argument('--base', default=os.getcwd(),
+                    help='Working directory (default: current directory)')
+args = parser.parse_args()
+base = args.base
+
 kali = os.path.join(base, 'kali.tar')
 initroot = os.path.join(base, 'work', 'initramfs_root')
 
@@ -19,11 +26,9 @@ def kali_members(prefixes):
                     break
     return found
 
-# kali drivers
 k_mod = kali_members([f'usr/lib/modules/{MOD}/'])
 k_fw = kali_members(['usr/lib/firmware/'])
 
-# initramfs drivers (from extracted tree)
 def tree_files(root, prefix):
     out = {}
     p = os.path.join(root, *prefix.split('/'))
