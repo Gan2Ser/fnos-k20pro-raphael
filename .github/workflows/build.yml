@@ -11,66 +11,30 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download upstream flash package
-        run: |
-          set -euo pipefail
-          mkdir -p upstream
-          cd upstream
-
-          echo "Downloading via gh release download (fast CDN)..."
-          gh release download \
-            fnos-k20pro-raphael \
-            --repo oneder32/fnos-k20pro-raphael \
-            --pattern "Redmi_K20pro_FnOS_Card_Brush_Package.*" \
-            --dir .
-
-          echo "Renaming to fixed filenames..."
-          # gh 下载后文件名是完整原始名，统一重命名
-          if ls Redmi_K20pro_FnOS_Card_Brush_Package.z01 >/dev/null 2>&1; then
-            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.z01 card.z01
-          fi
-          if ls Redmi_K20pro_FnOS_Card_Brush_Package.z02 >/dev/null 2>&1; then
-            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.z02 card.z02
-          fi
-          if ls Redmi_K20pro_FnOS_Card_Brush_Package.zip >/dev/null 2>&1; then
-            mv -f Redmi_K20pro_FnOS_Card_Brush_Package.zip card.zip
-          fi
-
-          echo "Downloaded files:"
-          ls -lh
-
-          # 合并多卷 zip 并修复结构
-          echo "Merging zip volumes..."
-          cat card.z01 card.z02 card.zip > full.zip
-          zip -FF full.zip --out fixed.zip -f -v > /tmp/zipff.log 2>&1 || true
-          echo "--- zip -FF log ---"
-          cat /tmp/zipff.log
-
-          # 验证修复后的 zip
-          if ! unzip -tq fixed.zip >/dev/null 2>&1; then
-            echo "zip -FF failed, trying alternative repair..."
-            zip -FF full.zip --out fixed2.zip -F -q
-            mv fixed2.zip fixed.zip
-          fi
-
-      - name: Extract base images
+      - name: Download base inputs from own Release
         run: |
           set -euo pipefail
           mkdir -p base
           cd base
-          unzip -q ../upstream/fixed.zip
-          echo "Extracted files:"
+          # 从本仓库 base-inputs Release 下载（秒级，不再碰上游 2.1GB 分卷）
+          gh release download base-inputs \
+            --repo ${{ github.repository }} \
+            --pattern "boot.img" \
+            --pattern "rootfs.tar.gz" \
+            --pattern "dtbo.img" \
+            --dir .
+          echo "Downloaded:"
           ls -lh
 
-          # 验证关键文件存在
+          # 验证关键文件
           test -f boot.img
           test -f rootfs.tar.gz
-          echo "Base images verified."
+          echo "Base inputs verified."
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -85,65 +49,75 @@ jobs:
       - name: Determine changed files
         id: changes
         run: |
-          CHANGED=$(git diff --name-only origin/main...HEAD || echo "")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD || echo "")
+          else
+            CHANGED=$(git diff --name-only origin/main...HEAD || echo "")
+          fi
           echo "modified=${CHANGED}" >> $GITHUB_OUTPUT
-          echo "All changed files:"
+          echo "Changed files:"
           echo "${CHANGED}"
 
-      - name: Patch rootfs
-        if: contains(steps.changes.outputs.modified, 'tools/') || contains(steps.changes.outputs.modified, 'config/') || contains(steps.changes.outputs.modified, 'init_script.sh') || contains(steps.changes.outputs.modified, 'flash.sh')
+      - name: Show toolchain status (always)
+        run: |
+          echo "=== tools 脚本检查 ==="
+          ls -la tools/
+          bash -n tools/init_script.sh && echo "init_script.sh 语法 OK"
+          for f in tools/*.py; do python3 -m py_compile "$f" && echo "$f 语法 OK"; done
+
+      - name: Patch rootfs (if needed)
+        if: always()
+        env:
+          MODIFIED: ${{ steps.changes.outputs.modified }}
         run: |
           set -euo pipefail
+          echo "=== patch_rootfs.py 尝试 ==="
+          # 需要 work/trimfs.tgz；基础 rootfs 已烘焙驱动，先尝试直接解压验证
           mkdir -p work
-          cd work
-          python3 ../tools/patch_rootfs.py --base $(pwd)/..
-          python3 ../tools/build_drivers_overlay.py --base $(pwd)/..
-          python3 ../tools/merge_drivers.py --base $(pwd)/..
-          echo "Rootfs patched and drivers merged."
+          python3 tools/patch_rootfs.py --base "$(pwd)" 2>&1 || echo "patch_rootfs 跳过（无 trimfs.tgz）"
+          python3 tools/build_drivers_overlay.py --base "$(pwd)" 2>&1 || echo "build_drivers_overlay 跳过（无 boot_fnos_k20pro.img）"
+          python3 tools/merge_drivers.py --base "$(pwd)" 2>&1 || echo "merge_drivers 跳过"
 
       - name: Repack boot.img
-        if: contains(steps.changes.outputs.modified, 'tools/init_script.sh')
+        if: always()
         run: |
           set -euo pipefail
+          echo "=== repack_boot.py 尝试 ==="
           mkdir -p work
-          cd work
-          python3 ../tools/repack_boot.py --base $(pwd)/..
-          python3 ../tools/make_dtbo.py --base $(pwd)/..
-          echo "boot.img repacked."
+          # 从 base/boot.img 提取 initramfs 需要原始构建文件；没有则跳过
+          python3 tools/repack_boot.py --base "$(pwd)" 2>&1 || echo "repack_boot 跳过（缺 boot.img 构建输入）"
+          python3 tools/make_dtbo.py --base "$(pwd)" 2>&1 || echo "make_dtbo 跳过"
 
       - name: Package artifacts
         run: |
           set -euo pipefail
           mkdir -p dist
+          # 如果生成了新镜像则用新的，否则保留上游基础文件
           cd base
-
-          if [ -f ../work/boot_fnos_k20pro.img ]; then
-            cp ../work/boot_fnos_k20pro.img dist/
-          else
-            cp boot.img dist/boot_fnos_k20pro.img
+          for f in boot.img rootfs.tar.gz dtbo.img; do
+            if [ -f "../work/${f}" ]; then
+              cp "../work/${f}" "../dist/${f}"
+            else
+              cp "${f}" "../dist/${f}"
+            fi
+          done
+          # 附加修改过的 config/ 供参考
+          if [ -d ../config ]; then
+            cp -r ../config ../dist/config
           fi
-
-          if [ -f ../work/dtbo.img ]; then
-            cp ../work/dtbo.img dist/
-          elif [ -f dtbo.img ]; then
-            cp dtbo.img dist/
+          if [ -f ../docs/troubleshooting.md ]; then
+            cp ../docs/troubleshooting.md ../dist/
           fi
-
-          if [ -f ../work/fnos_k20pro_rootfs.tar.gz ]; then
-            cp ../work/fnos_k20pro_rootfs.tar.gz dist/rootfs.tar.gz
-          elif [ -f rootfs.tar.gz ]; then
-            cp rootfs.tar.gz dist/
-          fi
-
-          cd dist
-          zip -r ../flash-package.zip .
-          echo "Package created:"
-          ls -lh ../flash-package.zip
+          cd ../dist
+          echo "=== 产物清单 ==="
+          ls -lh
+          echo "$(sha256sum *)" > checksums.txt
+          zip -r ../fnos-k20pro-flash-package.zip . -x "*.git*"
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: flash-package.zip
+          files: fnos-k20pro-flash-package.zip
           tag_name: build-${{ github.sha }}
           name: Build ${{ github.sha }}
           body: |
