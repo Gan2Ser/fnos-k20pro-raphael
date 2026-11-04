@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
 
-# 同一分支同时只允许一个构建，避免并发 tag 冲突
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
@@ -26,7 +25,6 @@ jobs:
           set -euo pipefail
           mkdir -p base
           cd base
-          # 从本仓库 base-inputs Release 下载（秒级，不再碰上游 2.1GB 分卷）
           gh release download base-inputs \
             --repo ${{ github.repository }} \
             --pattern "boot.img" \
@@ -35,8 +33,6 @@ jobs:
             --dir .
           echo "Downloaded:"
           ls -lh
-
-          # 验证关键文件
           test -f boot.img
           test -f rootfs.tar.gz
           echo "Base inputs verified."
@@ -49,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq lzma
+          sudo apt-get install -y -qq lzma zip
 
       - name: Determine changed files
         id: changes
@@ -63,67 +59,60 @@ jobs:
           echo "Changed files:"
           echo "${CHANGED}"
 
-      - name: Show toolchain status (always)
+      - name: Show toolchain status
         run: |
           echo "=== tools 脚本检查 ==="
           ls -la tools/
           bash -n tools/init_script.sh && echo "init_script.sh 语法 OK"
           for f in tools/*.py; do python3 -m py_compile "$f" && echo "$f 语法 OK"; done
 
-      - name: Patch rootfs (if needed)
-        if: always()
-        env:
-          MODIFIED: ${{ steps.changes.outputs.modified }}
+      - name: Verify recovery installer scripts
         run: |
-          set -euo pipefail
-          echo "=== patch_rootfs.py 尝试 ==="
-          mkdir -p work
-          python3 tools/patch_rootfs.py --base "$(pwd)" 2>&1 || echo "patch_rootfs 跳过（无 trimfs.tgz）"
-          python3 tools/build_drivers_overlay.py --base "$(pwd)" 2>&1 || echo "build_drivers_overlay 跳过（无 boot_fnos_k20pro.img）"
-          python3 tools/merge_drivers.py --base "$(pwd)" 2>&1 || echo "merge_drivers 跳过"
+          bash -n flash-package/META-INF/com/google/android/update-binary && echo "update-binary 语法 OK"
+          test -f flash-package/META-INF/com/google/android/updater-script && echo "updater-script 存在"
 
-      - name: Repack boot.img
-        if: always()
+      - name: Assemble standard flashable zip
         run: |
           set -euo pipefail
-          echo "=== repack_boot.py 尝试 ==="
-          mkdir -p work
-          python3 tools/repack_boot.py --base "$(pwd)" 2>&1 || echo "repack_boot 跳过（缺 boot.img 构建输入）"
-          python3 tools/make_dtbo.py --base "$(pwd)" 2>&1 || echo "make_dtbo 跳过"
-
-      - name: Package artifacts
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cd base
-          for f in boot.img rootfs.tar.gz dtbo.img; do
-            if [ -f "../work/${f}" ]; then
-              cp "../work/${f}" "../dist/${f}"
-            else
-              cp "${f}" "../dist/${f}"
-            fi
-          done
-          if [ -d ../config ]; then
-            cp -r ../config ../dist/config
-          fi
-          if [ -f ../docs/troubleshooting.md ]; then
-            cp ../docs/troubleshooting.md ../dist/
-          fi
-          cd ../dist
-          echo "=== 产物清单 ==="
-          ls -lh
-          echo "$(sha256sum *)" > checksums.txt
-          zip -r ../fnos-k20pro-flash-package.zip . -x "*.git*"
+          rm -rf pkg
+          mkdir -p pkg
+          # 基础镜像
+          cp base/boot.img pkg/
+          cp base/dtbthem  2>/dev/null || true
+          cp base/dtbo.img pkg/ 2>/dev/null || true
+          cp base/rootfs.tar.gz pkg/
+          # Recovery 刷机脚本
+          cp -r flash-package/META-INF pkg/
+          # 参考文件（不参与刷机）
+          if [ -d config ]; then cp -r config pkg/config; fi
+          if [ -f docs/troubleshooting.md ]; then cp docs/troubleshooting.md pkg/; fi
+          echo "=== pkg 内容 ==="
+          find pkg -type f | head -30
+          # 打包成标准卡刷 zip（rootfs 大文件不压缩，加快解压）
+          cd pkg
+          zip -0 -r ../fnos-k20pro-Card_Brush_Package.zip META-INF boot.img rootfs.tar.gz
+          if [ -f dtbo.img ]; then zip -0 ../fnos-k20pro-Card_Brush_Package.zip dtbo.img; fi
+          if [ -d config ]; then zip -r ../fnos-k20pro-Card_Brush_Package.zip config; fi
+          if [ -f troubleshooting.md ]; then zip -r ../fnos-k20pro-Card_Brush_Package.zip troubleshooting.md; fi
+          cd ..
+          echo "=== 产物 ==="
+          ls -lh fnos-k20pro-Card_Brush_Package.zip
+          md5sum fnos-k20pro-Card_Brush_Package.zip > checksums.txt
+          cat checksums.txt
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
-          files: fnos-k20pro-flash-package.zip
-          # run_id 保证 tag 唯一，避免并发冲突
+          files: |
+            fnos-k20pro-Card_Brush_Package.zip
+            checksums.txt
           tag_name: build-${{ github.sha }}-${{ github.run_id }}
           name: Build ${{ github.sha }} (run ${{ github.run_id }})
           body: |
             Automated build from commit ${{ github.sha }}.
             Modified files: ${{ steps.changes.outputs.modified }}
+            This is a STANDARD Recovery flashable zip.
+            " Flash via TWRP/OrangeFox directly. ",
+            backup: 进入 TWRP -> Wipe -> Format data 前请先备份。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
