@@ -71,39 +71,35 @@ jobs:
           bash -n flash-package/META-INF/com/google/android/update-binary && echo "update-binary 语法 OK"
           test -f flash-package/META-INF/com/google/android/updater-script && echo "updater-script 存在"
 
-      - name: Assemble standard flashable zip
+      - name: Assemble standard flashable zip (split <2GB for GitHub limit)
         run: |
           set -euo pipefail
           rm -rf pkg
           mkdir -p pkg
-          # 基础镜像
           cp base/boot.img pkg/
-          cp base/dtbthem  2>/dev/null || true
           cp base/dtbo.img pkg/ 2>/dev/null || true
           cp base/rootfs.tar.gz pkg/
-          # Recovery 刷机脚本
           cp -r flash-package/META-INF pkg/
-          # 参考文件（不参与刷机）
           if [ -d config ]; then cp -r config pkg/config; fi
           if [ -f docs/troubleshooting.md ]; then cp docs/troubleshooting.md pkg/; fi
           echo "=== pkg 内容 ==="
           find pkg -type f | head -30
-          # 打包成标准卡刷 zip（rootfs 大文件不压缩，加快解压）
+          # rootfs 大文件不压缩（已 gzip），并分卷成 1900MB，规避 GitHub 2GB 单文件上限
           cd pkg
-          zip -0 -r ../fnos-k20pro-Card_Brush_Package.zip META-INF boot.img rootfs.tar.gz
-          if [ -f dtbo.img ]; then zip -0 ../fnos-k20pro-Card_Brush_Package.zip dtbo.img; fi
-          if [ -d config ]; then zip -r ../fnos-k20pro-Card_Brush_Package.zip config; fi
-          if [ -f troubleshooting.md ]; then zip -r ../fnos-k20pro-Card_Brush_Package.zip troubleshooting.md; fi
+          zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip META-INF boot.img rootfs.tar.gz
+          if [ -f dtbo.img ]; then zip -0 -j -s 1900m ../fnos-k20pro-Card_Brush_Package.zip dtbo.img; fi
           cd ..
-          echo "=== 产物 ==="
-          ls -lh fnos-k20pro-Card_Brush_Package.zip
-          md5sum fnos-k20pro-Card_Brush_Package.zip > checksums.txt
+          echo "=== 分卷产物 ==="
+          ls -lh fnos-k20pro-Card_Brush_Package.*
+          md5sum fnos-k20pro-Card_Brush_Package.* > checksums.txt
           cat checksums.txt
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
+            fnos-k20pro-Card_Brush_Package.z01
+            fnos-k20pro-Card_Brush_Package.z02
             fnos-k20pro-Card_Brush_Package.zip
             checksums.txt
           tag_name: build-${{ github.sha }}-${{ github.run_id }}
@@ -111,8 +107,17 @@ jobs:
           body: |
             Automated build from commit ${{ github.sha }}.
             Modified files: ${{ steps.changes.outputs.modified }}
-            This is a STANDARD Recovery flashable zip.
-            " Flash via TWRP/OrangeFox directly. ",
-            backup: 进入 TWRP -> Wipe -> Format data 前请先备份。
+
+            ## 使用方法（Windows）
+            1. 下载全部 3 个分卷到同一文件夹，保持文件名不变
+            2. 打开 CMD/PowerShell 执行合并：
+               ```
+               copy /b fnos-k20pro-Card_Brush_Package.z01 + fnos-k20pro-Card_Brush_Package.z02 + fnos-k20pro-Card_Brush_Package.zip fnos-full.zip
+               ```
+            3. 或 Linux/macOS：
+               ```
+               cat fnos-k20pro-Card_Brush_Package.z01 fnos-k20pro-Card_Brush_Package.z02 fnos-k20pro-Card_Brush_Package.zip > fnos-full.zip
+               ```
+            4. 把 fnos-full.zip 拷入手机，TWRP/OrangeFox 直接刷入
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
