@@ -59,33 +59,51 @@ jobs:
           echo "Changed files:"
           echo "${CHANGED}"
 
-      - name: Show toolchain status
+      - name: Patch rootfs directly
+        if: always()
         run: |
-          echo "=== tools 脚本检查 ==="
-          ls -la tools/
-          bash -n tools/init_script.sh && echo "init_script.sh 语法 OK"
-          for f in tools/*.py; do python3 -m py_compile "$f" && echo "$f 语法 OK"; done
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          python3 ../tools/patch_rootfs.py --base "$(pwd)/.."
+          echo "rootfs patch exit: $?"
 
-      - name: Verify recovery installer scripts
+      - name: Repack boot.img directly
+        if: always()
         run: |
-          bash -n flash-package/META-INF/com/google/android/update-binary && echo "update-binary 语法 OK"
-          test -f flash-package/META-INF/com/google/android/updater-script && echo "updater-script 存在"
+          set -euo pipefail
+          mkdir -p work
+          cd work
+          python3 ../tools/repack_boot.py --base "$(pwd)/.."
+          echo "boot repack exit: $?"
 
       - name: Assemble standard split flashable zip
         run: |
           set -euo pipefail
           rm -rf pkg
           mkdir -p pkg
-          cp base/boot.img pkg/
-          cp base/dtbo.img pkg/ 2>/dev/null || true
-          cp base/rootfs.tar.gz pkg/
-          cp -r flash-package/META-INF pkg/
-          if [ -d config ]; then cp -r config pkg/config; fi
-          if [ -f docs/troubleshooting.md ]; then cp docs/troubleshooting.md pkg/; fi
+          cd base
+          if [ -f ../work/boot_fnos_k20pro.img ]; then
+            cp ../work/boot_fnos_k20pro.img ../pkg/boot.img
+          else
+            cp boot.img ../pkg/boot.img
+          fi
+          if [ -f ../work/dtbo.img ]; then
+            cp ../work/dtbo.img ../pkg/ 2>/dev/null || true
+          elif [ -f dtbo.img ]; then
+            cp dtbo.img ../pkg/ 2>/dev/null || true
+          fi
+          if [ -f ../work/rootfs_patched.tar.gz ]; then
+            cp ../work/rootfs_patched.tar.gz ../pkg/rootfs.tar.gz
+          else
+            cp rootfs.tar.gz ../pkg/rootfs.tar.gz
+          fi
+          cp -r ../flash-package/META-INF ../pkg/
+          if [ -d ../config ]; then cp -r ../config ../pkg/config; fi
+          if [ -f ../docs/troubleshooting.md ]; then cp ../docs/troubleshooting.md ../pkg/; fi
           echo "=== pkg 内容 ==="
-          find pkg -type f | head -30
+          find ../pkg -type f | head -30
 
-          # 标准分卷 zip：单条命令一次打包所有文件（禁止在分卷 zip 上追加）
           cd pkg
           zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip \
             META-INF boot.img dtbo.img rootfs.tar.gz 2>/dev/null
@@ -94,7 +112,6 @@ jobs:
           fi
           cd ..
 
-          # 确保分卷完整
           echo "=== 分卷产物 ==="
           ls -lh fnos-k20pro-Card_Brush_Package.*
           md5sum fnos-k20pro-Card_Brush_Package.* > checksums.txt
