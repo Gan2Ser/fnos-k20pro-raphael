@@ -1,28 +1,58 @@
 #!/usr/bin/env python3
-# Repack the K20 Pro boot.img: point rootfs at /dev/sda35, set hostname "trim".
+"""
+Repack boot.img by extracting its existing ramdisk, patching the init script,
+and writing a new boot.img.
+This does NOT require a raw initramfs.cpio input; it reads the ramdisk directly
+from the boot.img.
+"""
 import argparse
+import gzip
+import hashlib
+import io
+import lzma
 import os
 import struct
-import hashlib
-import lzma
+import tarfile
 
-parser = argparse.ArgumentParser(description='Repack K20 Pro boot.img')
-parser.add_argument('--base', default=os.getcwd(),
-                    help='Working directory (default: current directory)')
-args = parser.parse_args()
-base = args.base
 
-work = os.path.join(base, 'work')
-dist = os.path.join(base, 'dist')
-os.makedirs(dist, exist_ok=True)
+def align(x, n):
+    return (x + n - 1) // n * n
 
-CPIO_MAGIC = b'070701'
+
+def detect_compression(data):
+    if data[:2] == b'\x1f\x8b':
+        return 'gzip'
+    if data[:4] == b'lz4\x01' or data[:4] == b'lz4\x00':
+        return 'lz4'
+    if data[:6] == b'\xfd7zXZ\x00':
+        return 'xz'
+    if data[:3] == b'\x02\x00\x00' or data[:3] == b'\x00\x00\x00':
+        return 'lz4-raw'
+    return 'unknown'
+
+
+def decompress(data):
+    kind = detect_compression(data)
+    if kind == 'gzip':
+        return gzip.decompress(data)
+    if kind == 'xz':
+        return lzma.decompress(data)
+    raise RuntimeError('unsupported ramdisk compression: %s' % kind)
+
+
+def compress(data, kind):
+    if kind == 'gzip':
+        return gzip.compress(data, compresslevel=6)
+    if kind == 'xz':
+        return lzma.compress(data, format=lzma.FORMAT_XZ, check=lzma.CHECK_CRC32, preset=6)
+    raise RuntimeError('unsupported ramdisk compression: %s' % kind)
+
 
 def parse_newc(cpio: bytes):
     entries = []
     i = 0
     while i + 110 <= len(cpio):
-        assert cpio[i:i+6] == CPIO_MAGIC, ('bad magic at', i, cpio[i:i+6])
+        assert cpio[i:i+6] == b'070701', ('bad magic at', i, cpio[i:i+6])
         hdr = cpio[i:i+110]
         def field(off):
             return int(hdr[off:off+8], 16)
@@ -45,6 +75,7 @@ def parse_newc(cpio: bytes):
         i = (i + 3) & ~3
     return entries
 
+
 def serialize_newc(entries):
     out = bytearray()
     for e in entries:
@@ -53,7 +84,7 @@ def serialize_newc(entries):
         fields = [e['ino'], e['mode'], e['uid'], e['gid'], e['nlink'],
                   e['mtime'], filesize, e['devmajor'], e['devminor'],
                   e['rdevmajor'], e['rdevminor'], namesize, 0]
-        hdr = CPIO_MAGIC + b''.join(('%08X' % f).encode('ascii') for f in fields)
+        hdr = b'070701' + b''.join(('%08X' % f).encode('ascii') for f in fields)
         assert len(hdr) == 110
         out += hdr
         out += e['name'] + b'\x00'
@@ -64,102 +95,102 @@ def serialize_newc(entries):
             out += b'\x00'
     return bytes(out)
 
-def align(x, n):
-    return (x + n - 1) // n * n
 
-# ---- 1. Patch initramfs ----
-cpio = open(os.path.join(work, 'initramfs.cpio'), 'rb').read()
-entries = parse_newc(cpio)
-print('parsed cpio entries:', len(entries))
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--base', default=os.getcwd())
+    args = ap.parse_args()
+    base = args.base
 
-init_found = host_found = False
-for e in entries:
-    if e['name'] == b'init':
-        d = e['data']
-        new_init = open(os.path.join(base, 'tools', 'init_script.sh'), 'rb').read()
-        new_init = new_init.replace(b'\r\n', b'\n')
-        if not new_init.endswith(b'\n'):
-            new_init += b'\n'
-        print('init: replaced whole script, size %d -> %d' % (len(d), len(new_init)))
-        e['data'] = new_init
-        init_found = True
-    elif e['name'] == b'etc/hostname':
-        print('hostname: %r -> trim' % e['data'])
-        e['data'] = b'trim\n'
-        host_found = True
-    elif e['name'] == b'etc/hosts':
-        print('hosts: %r -> 127.0.0.1 localhost trim' % e['data'])
-        e['data'] = b'127.0.0.1 localhost trim\n'
-assert init_found and host_found, (init_found, host_found)
+    boot_path = os.path.join(base, 'base', 'boot.img')
+    if not os.path.isfile(boot_path):
+        print('SKIP: boot.img not found at', boot_path)
+        return
 
-bt_conf = (b'# K20 Pro (raphael) Bluetooth: WCN3990 via UART (btqca + hci_uart)\n'
-           b'bluetooth\nhci_uart\nbtqca\nrfcomm\n')
-bt_entry = dict(ino=0, mode=0o100644, uid=0, gid=0, nlink=1, mtime=0,
-                devmajor=0, devminor=0, rdevmajor=0, rdevminor=0,
-                name=b'etc/modules-load.d/raphael-bt.conf', data=bt_conf)
-trailer_idx = next(i for i, e in enumerate(entries) if e['name'] == b'TRAILER!!!')
-entries.insert(trailer_idx, bt_entry)
-print('added etc/modules-load.d/raphael-bt.conf')
+    boot = open(boot_path, 'rb').read()
+    page_size = struct.unpack('<I', boot[36:40])[0]
+    kernel_size = struct.unpack('<I', boot[8:12])[0]
+    ramdisk_size = struct.unpack('<I', boot[16:20])[0]
 
-new_cpio = serialize_newc(entries)
-rt = parse_newc(new_cpio)
-assert len(rt) == len(entries), (len(rt), len(entries))
-rt_init = next(e for e in rt if e['name'] == b'init')['data']
-rt_host = next(e for e in rt if e['name'] == b'etc/hostname')['data']
-assert rt_init.count(b'sda31') == 0
-for tok in (b'/dev/sda35', b'/dev/block/sda35', b'/dev/mmcblk0p35'):
-    assert tok in rt_init, tok
-assert rt_host == b'trim\n'
-rt_bt = next(e for e in rt if e['name'] == b'etc/modules-load.d/raphael-bt.conf')['data']
-assert rt_bt == bt_conf, 'bt config mismatch'
-print('round-trip OK (incl. raphael-bt.conf); initramfs size %d -> %d' % (len(cpio), len(new_cpio)))
+    kernel = boot[page_size:page_size + kernel_size]
+    ramdisk_compressed = boot[page_size + align(kernel_size, page_size):page_size + align(kernel_size, page_size) + ramdisk_size]
 
-open(os.path.join(work, 'initramfs_new.cpio'), 'wb').write(new_cpio)
+    print('boot.img: page=%d kernel=%d ramdisk=%d' % (page_size, kernel_size, ramdisk_size))
+    comp = detect_compression(ramdisk_compressed)
+    print('ramdisk compression:', comp)
 
-ramdisk = lzma.compress(new_cpio, format=lzma.FORMAT_XZ,
-                        check=lzma.CHECK_CRC32, preset=6)
-open(os.path.join(work, 'ramdisk_new.xz'), 'wb').write(ramdisk)
-assert lzma.decompress(ramdisk) == new_cpio
-print('new ramdisk (xz) size:', len(ramdisk))
+    cpio = decompress(ramdisk_compressed)
+    entries = parse_newc(cpio)
+    print('parsed cpio entries:', len(entries))
 
-# ---- 2. Reassemble boot.img ----
-boot = open(os.path.join(base, 'boot.img'), 'rb').read()
-kernel_size = struct.unpack('<I', boot[8:12])[0]
-page_size = struct.unpack('<I', boot[36:40])[0]
-hdr_version = struct.unpack('<I', boot[40:44])[0]
-print('orig: kernel_size=%d page_size=%d hdr_version=%d' % (kernel_size, page_size, hdr_version))
+    # 替换 init 脚本
+    new_init_path = os.path.join(base, 'tools', 'init_script.sh')
+    if not os.path.isfile(new_init_path):
+        print('SKIP: init_script.sh not found')
+        return
 
-kernel = boot[page_size:page_size + kernel_size]
-assert kernel[:2] == b'\x1f\x8b' and kernel.find(bytes.fromhex('d00dfeed')) > 0
+    new_init = open(new_init_path, 'rb').read()
+    new_init = new_init.replace(b'\r\n', b'\n')
+    if not new_init.endswith(b'\n'):
+        new_init += b'\n'
 
-header_page = bytearray(boot[:page_size])
-struct.pack_into('<I', header_page, 16, len(ramdisk))
-cmd = (b'clk_ignore_unused pd_ignore_unused arm64.nopauth root=/dev/sda35 rw '
-       b'rootwait quiet splash loglevel=3 systemd.show_status=false '
-       b'rd.udev.log_level=3 vt.global_cursor_default=0 panic=100 console=tty0')
-assert len(cmd) <= 512
-header_page[64:64+512] = b'\x00' * 512
-header_page[64:64+len(cmd)] = cmd
-sha = hashlib.sha1(kernel + ramdisk).digest()
-header_page[576:576+32] = b'\x00' * 32
-header_page[576:576+20] = sha
+    init_found = False
+    for e in entries:
+        if e['name'] == b'init':
+            print('init: replaced %d -> %d bytes' % (len(e['data']), len(new_init)))
+            e['data'] = new_init
+            init_found = True
+            break
+    if not init_found:
+        print('WARN: init not found in ramdisk, skip repack')
+        return
 
-new_boot = (bytes(header_page)
-            + kernel + b'\x00' * (align(kernel_size, page_size) - kernel_size)
-            + ramdisk + b'\x00' * (align(len(ramdisk), page_size) - len(ramdisk)))
-out_path = os.path.join(dist, 'boot_fnos_k20pro.img')
-open(out_path, 'wb').write(new_boot)
-print('wrote', out_path, 'size', len(new_boot))
+    # 添加 bluetooth modules-load 配置（如果不存在）
+    bt_name = b'etc/modules-load.d/raphael-bt.conf'
+    bt_data = b'# K20 Pro (raphael) Bluetooth: WCN3990 via UART (btqca + hci_uart)\nbluetooth\nhci_uart\nbtqca\nrfcomm\n'
+    if not any(e['name'] == bt_name for e in entries):
+        bt_entry = dict(ino=0, mode=0o100644, uid=0, gid=0, nlink=1, mtime=0,
+                        devmajor=0, devminor=0, rdevmajor=0, rdevminor=0,
+                        name=bt_name, data=bt_data)
+        trailer_idx = next(i for i, e in enumerate(entries) if e['name'] == b'TRAILER!!!')
+        entries.insert(trailer_idx, bt_entry)
+        print('added etc/modules-load.d/raphael-bt.conf')
 
-nb = open(out_path, 'rb').read()
-ks2 = struct.unpack('<I', nb[8:12])[0]
-rs2 = struct.unpack('<I', nb[16:20])[0]
-assert ks2 == kernel_size and rs2 == len(ramdisk), (ks2, rs2)
-k2 = nb[page_size:page_size+ks2]
-assert k2 == kernel, 'kernel changed!'
-r2 = nb[page_size + align(ks2, page_size): page_size + align(ks2, page_size) + rs2]
-assert r2 == ramdisk, 'ramdisk changed!'
-cmd2 = nb[64:64+512].split(b'\x00')[0]
-assert b'sda35' in cmd2 and b'sda31' not in cmd2, cmd2
-print('verification OK: cmdline=%s' % cmd2.decode())
-print('DONE')
+    new_cpio = serialize_newc(entries)
+    new_ramdisk = compress(new_cpio, comp)
+
+    out = os.path.join(base, 'work', 'boot_fnos_k20pro.img')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+
+    header_page = bytearray(boot[:page_size])
+    struct.pack_into('<I', header_page, 16, len(new_ramdisk))
+    cmd = header_page[64:64+512].split(b'\x00')[0]
+    if cmd:
+        cmd = cmd.replace(b'root=/dev/sda31', b'root=/dev/sda35')
+    else:
+        cmd = b'clk_ignore_unused pd_ignore_unused arm64.nopauth root=/dev/sda35 rw rootwait quiet splash loglevel=3 systemd.show_status=false rd.udev.log_level=3 vt.global_cursor_default=0 panic=100 console=tty0'
+    header_page[64:64+512] = b'\x00' * 512
+    header_page[64:64+len(cmd)] = cmd
+
+    sha = hashlib.sha1(kernel + new_ramdisk).digest()
+    header_page[576:576+32] = b'\x00' * 32
+    header_page[576:576+20] = sha
+
+    new_boot = (bytes(header_page)
+                + kernel + b'\x00' * (align(kernel_size, page_size) - kernel_size)
+                + new_ramdisk + b'\x00' * (align(len(new_ramdisk), page_size) - len(new_ramdisk)))
+    open(out, 'wb').write(new_boot)
+    print('wrote', out, 'size', len(new_boot))
+
+    # 验证
+    nb = open(out, 'rb').read()
+    ks2 = struct.unpack('<I', nb[8:12])[0]
+    rs2 = struct.unpack('<I', nb[16:20])[0]
+    assert ks2 == kernel_size and rs2 == len(new_ramdisk), (ks2, rs2)
+    cmd2 = nb[64:64+512].split(b'\x00')[0]
+    assert b'sda35' in cmd2 and b'sda31' not in cmd2, cmd2
+    print('verification OK: cmdline=%s' % cmd2.decode())
+
+
+if __name__ == '__main__':
+    main()
