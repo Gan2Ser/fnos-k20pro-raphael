@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
-# Patch ./etc/fstab inside trimfs.tgz (gzip tar) by streaming, so that
-# every other member (symlinks, permissions, ownership, device nodes, PAX
-# headers) is preserved byte-for-byte.
+"""
+Directly patch an existing rootfs.tar.gz (from upstream card brush package)
+by overlaying local config/ and docs/ into it.
+No trimfs.tgz or original build tree required.
+"""
 import argparse
 import gzip
+import io
 import os
-
-parser = argparse.ArgumentParser(description='Patch fnOS rootfs fstab for K20 Pro')
-parser.add_argument('--base', default=os.getcwd(),
-                    help='Working directory (default: current directory)')
-args = parser.parse_args()
-base = args.base
-
-src = os.path.join(base, 'work', 'trimfs.tgz')
-dst = os.path.join(base, 'dist', 'fnos_k20pro_rootfs.tar.gz')
-
-NEW_FSTAB = (
-    b"# K20 Pro (sm8150) rootfs\n"
-    b"# Root is mounted by the boot.img initramfs from /dev/sda35\n"
-    b"# (ext4 first, f2fs fallback); these entries cover the early runtime.\n"
-    b"proc\t/proc\tproc\tdefaults\t0 0\n"
-    b"sysfs\t/sys\tsysfs\tdefaults\t0 0\n"
-    b"devtmpfs\t/dev\tdevtmpfs\tdefaults\t0 0\n"
-    b"tmpfs\t/run\ttmpfs\tdefaults\t0 0\n"
-    b"tmpfs\t/tmp\ttmpfs\tdefaults,nosuid,nodev\t0 0\n"
-)
+import tarfile
 
 
 def read_exact(f, n):
@@ -48,60 +32,70 @@ def parse_size(field):
 
 
 def main():
-    inp = gzip.open(src, 'rb')
-    out = gzip.open(dst, 'wb', compresslevel=6)
-    patched = False
-    members = 0
-    while True:
-        hdr = read_exact(inp, 512)
-        if len(hdr) < 512:
-            break
-        if hdr == b'\x00' * 512:
-            out.write(hdr)
-            nxt = read_exact(inp, 512)
-            if nxt == b'\x00' * 512:
-                out.write(nxt)
-            elif nxt:
-                out.write(nxt)
-            break
-        members += 1
-        name = hdr[0:100].split(b'\x00')[0]
-        size = parse_size(hdr[124:136])
-        typeflag = hdr[156:157]
-        if name == b'./etc/fstab' and typeflag in (b'0', b'\x00'):
-            # discard original data + padding
-            read_exact(inp, size)
-            pad = (512 - size % 512) % 512
-            if pad:
-                read_exact(inp, pad)
-            # build replacement header
-            nh = bytearray(hdr)
-            size_field = (b'%011o' % len(NEW_FSTAB)) + b'\x00'
-            assert len(size_field) == 12
-            nh[124:136] = size_field
-            nh[148:156] = b' ' * 8
-            cks = sum(nh)
-            nh[148:156] = (b'%06o' % cks) + b'\x00 '
-            out.write(bytes(nh))
-            out.write(NEW_FSTAB)
-            pad = (512 - len(NEW_FSTAB) % 512) % 512
-            if pad:
-                out.write(b'\x00' * pad)
-            patched = True
-        else:
-            out.write(hdr)
-            remaining = size
-            while remaining > 0:
-                chunk = read_exact(inp, min(1 << 20, remaining))
-                out.write(chunk)
-                remaining -= len(chunk)
-            pad = (512 - size % 512) % 512
-            if pad:
-                out.write(read_exact(inp, pad))
-    inp.close()
-    out.close()
-    assert patched, 'fstab member not found!'
-    print('patched ./etc/fstab; copied %d tar members to %s' % (members, dst))
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--base', default=os.getcwd())
+    args = ap.parse_args()
+    base = args.base
+
+    src = os.path.join(base, 'base', 'rootfs.tar.gz')
+    if not os.path.isfile(src):
+        print('SKIP: rootfs.tar.gz not found at', src)
+        return
+
+    # 读取原始 tar 所有条目到内存（保留权限/时间戳/符号链接/设备节点）
+    entries = {}
+    with tarfile.open(src, 'r:gz') as tf:
+        for m in tf:
+            entries[m.name] = m
+
+    # 需要注入的文件
+    injects = []
+    repo_root = base
+    for rel in [
+        os.path.join('config', 'k20-bluetooth.service'),
+        os.path.join('config', 'k20-hardware.service'),
+        os.path.join('config', 'k20-wifi.service'),
+        os.path.join('config', 'k20-load-drivers.sh'),
+        os.path.join('config', 'modules-load.d', 'k20pro.conf'),
+        os.path.join('config', 'udev', '99-k20pro.rules'),
+        os.path.join('docs', 'troubleshooting.md'),
+    ]:
+        p = os.path.join(repo_root, rel)
+        if os.path.isfile(p):
+            injects.append((rel, p))
+
+    if not injects:
+        print('SKIP: no local files to inject')
+        return
+
+    # 覆盖/新增条目
+    changed = 0
+    for rel, p in injects:
+        data = open(p, 'rb').read()
+        info = tarfile.TarInfo(name=rel)
+        info.size = len(data)
+        info.mtime = int(os.path.getmtime(p))
+        info.mode = os.stat(p).st_mode & 0o7777
+        info.uid = 0
+        info.gid = 0
+        info.uname = 'root'
+        info.gname = 'root'
+        if rel.endswith('.sh'):
+            info.mode = 0o755
+        entries[rel] = info
+        entries[rel].__dict__['_data'] = data  # 粘临时数据用于写盘
+        changed += 1
+
+    # 重新打包（保留压缩，但这里 rootfs.tar.gz 本身已经是 gzip，我们再 gzip 一次）
+    out = os.path.join(base, 'work', 'rootfs_patched.tar.gz')
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with tarfile.open(out, 'w:gz', compresslevel=6) as out_tf:
+        for name, m in entries.items():
+            if hasattr(m, '_data'):
+                out_tf.addfile(m, io.BytesIO(m._data))
+            else:
+                out_tf.addfile(m)
+    print('patched rootfs: %d entries, %d files changed -> %s' % (len(entries), changed, out))
 
 
 if __name__ == '__main__':
