@@ -104,14 +104,15 @@ jobs:
           echo "=== pkg 内容 ==="
           find ../pkg -type f | head -30
 
-          cd pkg
-          zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip \
+          # 关键修复：cd 到 ../pkg，不是 pkg
+          cd ../pkg
+          zip -0 -r -s 1900m ../../fnos-k20pro-Card_Brush_Package.zip \
             META-INF boot.img dtbo.img rootfs.tar.gz 2>/dev/null
           if [ -d config ]; then
-            zip -0 -r -s 1900m ../fnos-k20pro-Card_Brush_Package.zip config 2>/dev/null || true
+            zip -0 -r -s 1900m ../../fnos-k20pro-Card_Brush_Package.zip config 2>/dev/null || true
           fi
-          cd ..
 
+          cd ../../
           echo "=== 分卷产物 ==="
           ls -lh fnos-k20pro-Card_Brush_Package.*
           md5sum fnos-k20pro-Card_Brush_Package.* > checksums.txt
